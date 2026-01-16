@@ -1,0 +1,267 @@
+# ARG instructions do not create additional layers. Instead, next layers will
+# concatenate them. Also, we have to repeat ARG instructions in each build
+# stage that uses them.
+ARG GOLANG_VERSION=1.25.5
+
+# ----------------------------------------------
+# pdfcpu binary build stage
+# ----------------------------------------------
+# Note: this stage is required as pdfcpu does not release an armhf variant by
+# default.
+FROM golang:$GOLANG_VERSION AS pdfcpu-binary-stage
+
+# See https://github.com/pdfcpu/pdfcpu/releases.
+ARG PDFCPU_VERSION=v0.11.1
+ENV CGO_ENABLED=0
+
+# Define the working directory outside of $GOPATH (we're using go modules).
+WORKDIR /home
+
+RUN curl -Ls "https://github.com/pdfcpu/pdfcpu/archive/refs/tags/$PDFCPU_VERSION.tar.gz" -o pdfcpu.tar.gz &&\
+    tar --strip-components=1 -xvzf pdfcpu.tar.gz
+
+# Install module dependencies.
+RUN go mod download &&\
+    go mod verify
+
+RUN go build -o pdfcpu -ldflags "-s -w -X 'main.version=$PDFCPU_VERSION' -X 'github.com/pdfcpu/pdfcpu/pkg/pdfcpu.VersionStr=$PDFCPU_VERSION' -X main.builtBy=gotenberg" ./cmd/pdfcpu &&\
+    # Verify installation.
+    ./pdfcpu version
+
+# ----------------------------------------------
+# Gotenberg binary build stage
+# ----------------------------------------------
+FROM golang:$GOLANG_VERSION AS gotenberg-binary-stage
+
+ARG GOTENBERG_VERSION=snapshot
+ENV CGO_ENABLED=0
+
+# Define the working directory outside of $GOPATH (we're using go modules).
+WORKDIR /home
+
+# Install module dependencies.
+COPY go.mod go.sum ./
+
+RUN go mod download &&\
+    go mod verify
+
+# Copy the source code.
+COPY cmd ./cmd
+COPY pkg ./pkg
+
+RUN go build -o gotenberg -ldflags "-s -w -X 'github.com/gotenberg/gotenberg/v8/cmd.Version=$GOTENBERG_VERSION'" cmd/gotenberg/main.go
+
+# ----------------------------------------------
+# Final stage
+# ----------------------------------------------
+FROM registry.access.redhat.com/ubi10/ubi:latest
+
+ARG GOTENBERG_VERSION=snapshot
+ARG GOTENBERG_USER_GID=1001
+ARG GOTENBERG_USER_UID=1001
+# See https://github.com/googlefonts/noto-emoji/releases.
+ARG NOTO_COLOR_EMOJI_VERSION=v2.051
+# See https://gitlab.com/pdftk-java/pdftk/-/releases - Binary package.
+ARG PDFTK_VERSION=v3.3.3
+
+LABEL org.opencontainers.image.title="Gotenberg" \
+    org.opencontainers.image.description="A containerized API for seamless PDF conversion." \
+    org.opencontainers.image.version="$GOTENBERG_VERSION" \
+    org.opencontainers.image.authors="Julien Neuhart <neuhart.julien@gmail.com>" \
+    org.opencontainers.image.documentation="https://gotenberg.dev" \
+    org.opencontainers.image.source="https://github.com/gotenberg/gotenberg" \
+    org.opencontainers.image.base.name="registry.access.redhat.com/ubi10/ubi:latest"
+
+RUN \
+    # Create a non-root user.
+    # All processes in the Docker container will run with this dedicated user.
+    groupadd --gid "$GOTENBERG_USER_GID" gotenberg &&\
+    useradd --uid "$GOTENBERG_USER_UID" --gid gotenberg --shell /bin/bash --home /home/gotenberg --no-create-home gotenberg &&\
+    mkdir /home/gotenberg &&\
+    chown gotenberg: /home/gotenberg
+
+RUN \
+    # Install system dependencies required for the next instructions or debugging.
+    # Java 21 headless is used for PDFtk.
+    dnf update -y &&\
+    dnf install -y curl gnupg2 python3 java-21-openjdk-headless &&\
+    # Install EPEL for additional packages.
+    dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm &&\
+    # Install tini from upstream (not available in EPEL 10 yet).
+    TINI_VERSION=v0.19.0 &&\
+    curl -sL "https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini" -o /usr/bin/tini &&\
+    chmod +x /usr/bin/tini &&\
+    # Cleanup.
+    dnf clean all &&\
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+
+RUN \
+    # Install fonts.
+    # Note: UBI 10 has different font package names than UBI 9 and Debian.
+    dnf install -y \
+    fontconfig \
+    google-noto-fonts-common \
+    google-noto-sans-vf-fonts \
+    google-noto-serif-vf-fonts \
+    google-noto-sans-mono-vf-fonts \
+    liberation-mono-fonts \
+    liberation-fonts-common \
+    dejavu-sans-fonts \
+    dejavu-serif-fonts \
+    dejavu-sans-mono-fonts \
+    google-droid-sans-fonts \
+    urw-base35-fonts &&\
+    # Add Color Noto emoji font.
+    curl -Ls "https://github.com/googlefonts/noto-emoji/raw/$NOTO_COLOR_EMOJI_VERSION/fonts/NotoColorEmoji.ttf" -o /usr/share/fonts/NotoColorEmoji.ttf &&\
+    # Update font cache.
+    fc-cache -f -v &&\
+    # Cleanup.
+    dnf clean all &&\
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+
+RUN \
+    # Install Chromium dependencies and Chrome for Testing.
+    # Note: EPEL Chromium requires pipewire which is not available in UBI 10.
+    # We use Chrome for Testing (headless shell) from Google's official releases.
+    dnf install -y \
+    at-spi2-atk \
+    atk \
+    cups-libs \
+    dbus-libs \
+    expat \
+    libdrm \
+    libX11 \
+    libxcb \
+    libXcomposite \
+    libXdamage \
+    libXext \
+    libXfixes \
+    libXrandr \
+    libxkbcommon \
+    libxshmfence \
+    mesa-libgbm \
+    nspr \
+    nss \
+    nss-util \
+    pango \
+    alsa-lib \
+    unzip &&\
+    # Download Chrome for Testing (headless shell).
+    # See https://googlechromelabs.github.io/chrome-for-testing/
+    CHROME_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_STABLE") &&\
+    curl -sL "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VERSION}/linux64/chrome-headless-shell-linux64.zip" -o /tmp/chrome.zip &&\
+    unzip /tmp/chrome.zip -d /opt &&\
+    mv /opt/chrome-headless-shell-linux64 /opt/chrome &&\
+    ln -sf /opt/chrome/chrome-headless-shell /usr/bin/chromium-browser &&\
+    chmod +x /opt/chrome/chrome-headless-shell &&\
+    rm /tmp/chrome.zip &&\
+    # Verify installation.
+    /opt/chrome/chrome-headless-shell --version &&\
+    # Cleanup.
+    dnf clean all &&\
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+
+# Set default characterset encoding to UTF-8.
+# See:
+# https://github.com/gotenberg/gotenberg/issues/104
+# https://github.com/gotenberg/gotenberg/issues/730
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# See https://www.libreoffice.org/download/download-libreoffice/.
+ARG LIBREOFFICE_VERSION=25.2.7
+
+RUN \
+    # Install LibreOffice from official RPM distribution.
+    # LibreOffice is not available in EPEL 10 or UBI 10 repos.
+    # python3-setuptools is needed for distutils compatibility with Python 3.12+
+    # libxcrypt-compat provides libcrypt.so.1 needed by LibreOffice's bundled Python
+    dnf install -y cairo cups-libs libSM libXinerama libXext libXrender libxslt libxml2 python3-setuptools libxcrypt-compat &&\
+    curl -Ls "https://download.documentfoundation.org/libreoffice/stable/${LIBREOFFICE_VERSION}/rpm/x86_64/LibreOffice_${LIBREOFFICE_VERSION}_Linux_x86-64_rpm.tar.gz" -o /tmp/libreoffice.tar.gz &&\
+    tar -xzf /tmp/libreoffice.tar.gz -C /tmp &&\
+    dnf install -y /tmp/LibreOffice_${LIBREOFFICE_VERSION}*/RPMS/*.rpm &&\
+    rm -rf /tmp/libreoffice.tar.gz /tmp/LibreOffice_* &&\
+    # Create symlinks for easier access.
+    ln -sf /opt/libreoffice*/program/soffice /usr/bin/libreoffice &&\
+    ln -sf /opt/libreoffice*/program/soffice /usr/bin/soffice &&\
+    # Install unoconverter.
+    curl -Ls https://raw.githubusercontent.com/gotenberg/unoconverter/v0.1.1/unoconv -o /usr/bin/unoconverter &&\
+    chmod +x /usr/bin/unoconverter &&\
+    # unoconverter will look for the Python binary, which has to be at version 3.
+    ln -sf /usr/bin/python3 /usr/bin/python &&\
+    # Verify installations.
+    libreoffice --version &&\
+    unoconverter --version &&\
+    # Cleanup.
+    dnf clean all &&\
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+
+# See https://github.com/qpdf/qpdf/releases.
+ARG QPDF_VERSION=12.2.0
+
+RUN \
+    # Install PDFtk & ExifTool (PDF engines).
+    curl -o /usr/bin/pdftk-all.jar "https://gitlab.com/api/v4/projects/5024297/packages/generic/pdftk-java/$PDFTK_VERSION/pdftk-all.jar" &&\
+    chmod a+x /usr/bin/pdftk-all.jar &&\
+    printf '#!/bin/bash\n\nexec java -jar /usr/bin/pdftk-all.jar "$@"' > /usr/bin/pdftk && \
+    chmod +x /usr/bin/pdftk &&\
+    # Install QPDF from official pre-built binary (not available in EPEL 10).
+    # The zip extracts directly to /opt/bin and /opt/lib.
+    curl -sL "https://github.com/qpdf/qpdf/releases/download/v${QPDF_VERSION}/qpdf-${QPDF_VERSION}-bin-linux-x86_64.zip" -o /tmp/qpdf.zip &&\
+    unzip /tmp/qpdf.zip -d /opt/qpdf &&\
+    ln -sf /opt/qpdf/bin/qpdf /usr/bin/qpdf &&\
+    rm /tmp/qpdf.zip &&\
+    # Install ExifTool.
+    dnf install -y perl-Image-ExifTool &&\
+    # Verify installations.
+    pdftk --version &&\
+    qpdf --version &&\
+    exiftool -ver &&\
+    # Cleanup.
+    dnf clean all &&\
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+
+# Support for arbitrary user IDs (OpenShift).
+# See:
+# https://github.com/gotenberg/gotenberg/issues/1049.
+# https://docs.redhat.com/en/documentation/openshift_container_platform/4.15/html/images/creating-images#use-uid_create-images.
+RUN \
+    usermod -aG root gotenberg &&\
+    chgrp -R 0 /home/gotenberg &&\
+    chmod -R g=u /home/gotenberg
+
+# Improve fonts subpixel hinting and smoothing.
+# Credits:
+# https://github.com/arachnys/athenapdf/issues/69.
+# https://github.com/arachnys/athenapdf/commit/ba25a8d80a25d08d58865519c4cd8756dc9a336d.
+COPY build/fonts.conf /etc/fonts/conf.d/100-gotenberg.conf
+
+# Copy dictionnaries so that hypens work on Chromium.
+# See https://github.com/gotenberg/gotenberg/issues/1293.
+COPY --chown=gotenberg:gotenberg build/chromium-hyphen-data /opt/gotenberg/chromium-hyphen-data
+
+# Copy the Golang binaries.
+COPY --from=pdfcpu-binary-stage /home/pdfcpu /usr/bin/
+COPY --from=gotenberg-binary-stage /home/gotenberg /usr/bin/
+
+# Environment variables required by modules or else.
+# Note: Using Chrome for Testing headless shell on UBI.
+ENV CHROMIUM_BIN_PATH=/opt/chrome/chrome-headless-shell
+ENV CHROMIUM_HYPHEN_DATA_DIR_PATH=/opt/gotenberg/chromium-hyphen-data
+# LibreOffice is installed from official RPM distribution to /opt/libreoffice25.2/
+ENV LIBREOFFICE_BIN_PATH=/opt/libreoffice25.2/program/soffice.bin
+ENV UNOCONVERTER_BIN_PATH=/usr/bin/unoconverter
+ENV PDFTK_BIN_PATH=/usr/bin/pdftk
+# QPDF is installed from pre-built binary.
+ENV QPDF_BIN_PATH=/opt/qpdf/bin/qpdf
+ENV EXIFTOOL_BIN_PATH=/usr/bin/exiftool
+ENV PDFCPU_BIN_PATH=/usr/bin/pdfcpu
+
+USER gotenberg
+WORKDIR /home/gotenberg
+
+# Default API port.
+EXPOSE 3000
+
+ENTRYPOINT [ "/usr/bin/tini", "--" ]
+CMD [ "gotenberg" ]
